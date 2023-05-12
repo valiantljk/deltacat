@@ -2,7 +2,7 @@ import logging
 import time
 from collections import defaultdict
 from itertools import repeat
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import argparse
 import numpy as np
 import pyarrow as pa
@@ -12,14 +12,27 @@ from ray import cloudpickle
 from ray.types import ObjectRef
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import random,sys
-import botocore
+import asyncio
 import boto3
 import pickle
 import pandas as pd
 import ray
+import io
 
-def upload_df_to_s3(df, bucket, key):
-    df.to_parquet(f"s3://{bucket}/{key}")
+import boto3
+from botocore.exceptions import ClientError
+
+def upload_df_to_s3(df, bucket, key, region=None):
+    # Ensure boto3 session is in the correct region
+    s3 = boto3.resource('s3', region_name=region)
+
+    # Write the DataFrame to an in-memory parquet file
+    parquet_buffer = io.BytesIO()
+    df.to_parquet(parquet_buffer)
+
+    # Write the in-memory file to S3
+    s3.Object(bucket, key).put(Body=parquet_buffer.getvalue())
+
 
 def upload_to_s3(bucket: str, key: str, record_counts: Any, region: str):
     s3 = boto3.resource('s3', region_name=region)
@@ -28,8 +41,18 @@ def upload_to_s3(bucket: str, key: str, record_counts: Any, region: str):
     else:
         serialized_data = pickle.dumps(record_counts)
         s3.Object(bucket, key).put(Body=serialized_data)
-def download_df_from_s3(bucket, key):
-    return pd.read_parquet(f's3://{bucket}/{key}')
+def download_df_from_s3(bucket, key, region=None):
+    # Ensure boto3 session is in the correct region
+    s3 = boto3.resource('s3', region_name=region)
+
+    # Download the file to an in-memory buffer
+    parquet_buffer = io.BytesIO()
+    s3.Object(bucket, key).download_fileobj(parquet_buffer)
+
+    # Load the in-memory file to a DataFrame
+    df = pd.read_parquet(parquet_buffer)
+
+    return df
 def download_from_s3(bucket: str, key: str, region: str, data_type: str):
     if data_type=='parquet':
         return download_df_from_s3(bucket, key)
@@ -93,38 +116,36 @@ class RecordCountsPendingMaterializeDict:
 
     def is_finalized(self) -> bool:
         return self.actual_result_count == self.expected_result_count
-    def upload_to_s3(self, bucket, key, region):
+    def to_s3(self, bucket, key, region):
         upload_to_s3(bucket, key, self.record_counts,region)
 
 @ray.remote(num_cpus=1)
 class RecordCountsPendingMaterializeDF:
     def __init__(self, expected_result_count: int):
-        self.record_counts = pd.DataFrame(columns=['materialize_bucket', 'delta_file_locator', 'result_idx', 'rows'])
+        self.record_counts = defaultdict(
+            # delta_file_locator -> dedupe task index
+            lambda: defaultdict(
+                # dedupe task index -> row count
+                lambda: defaultdict(int)
+            )
+        )
+        self.record_counts_df = pd.DataFrame(columns=['materialize_bucket', 'delta_file_locator', 'result_idx', 'rows'])
         self.expected_result_count = expected_result_count
         self.actual_result_count = 0
 
     def add_record_counts(
             self,
             result_idx: int,
-            record_counts: Dict[int, Dict[Tuple[np.bool_, np.int64, np.int32], int]]) -> None:
+            record_counts:
+            Dict[int, Dict[Tuple[np.bool_, np.int64, np.int32], int]]) -> None:
         start = time.time()
         for mat_bucket, df_locator_rows in record_counts.items():
             for df_locator, rows in df_locator_rows.items():
-                mask = (self.record_counts['materialize_bucket'] == mat_bucket) & \
-                       (self.record_counts['delta_file_locator'] == df_locator) & \
-                       (self.record_counts['result_idx'] == result_idx)
-                if mask.any():
-                    self.record_counts.loc[mask, 'rows'] += rows
-                else:
-                    self.record_counts = self.record_counts.append({
-                        'materialize_bucket': mat_bucket,
-                        'delta_file_locator': df_locator,
-                        'result_idx': result_idx,
-                        'rows': rows
-                    }, ignore_index=True)
+                self.record_counts[mat_bucket][df_locator][result_idx] += rows
         self.actual_result_count += 1
         end = time.time()
         print(f"received from task {result_idx}, time taken {(end-start):.2f}")
+ 
 
     def get_record_counts(self):
         print(f"received task request for final data")
@@ -138,16 +159,34 @@ class RecordCountsPendingMaterializeDF:
 
     def is_finalized(self) -> bool:
         return self.actual_result_count == self.expected_result_count
-    def upload_to_s3(self, bucket, key, region):
-        upload_to_s3(bucket, key, self.record_counts,region)
+    def to_s3(self, bucket, key, region):
+        self.convert_to_df()
+        upload_to_s3(bucket, key, self.record_counts_df,region)
+
+    def convert_to_df(self):
+        self.record_counts_df = pd.DataFrame([
+            {"id": id, "tuple": tuple, "result_idx": result_idx, "count": count}
+            for id, inner_dict in self.record_counts.items()
+            for tuple, sub_dict in inner_dict.items()
+            for result_idx, count in sub_dict.items()
+        ])
+
+        # Split the tuple into separate columns
+        self.record_counts_df[['bool', 'int64', 'int32']] = pd.DataFrame(self.record_counts_df['tuple'].to_list(), index=self.record_counts_df.index)
+
+        # Drop the original tuple column
+        self.record_counts_df = self.record_counts_df.drop(columns=['tuple'])
+
 
 
 @ray.remote(num_cpus=1)
 def dedupe(dedupe_task_index: int, \
-    record_counts_pending_materialize: RecordCountsPendingMaterialize,\
+    record_counts_pending_materialize: Union[RecordCountsPendingMaterializeDF,RecordCountsPendingMaterializeDict],\
     number_src_dfl: int,
     number_mat_bucket: int,
+    singalactor: SignalActor,
     ):
+    delegator_indices = [32 * i for i in range(number_mat_bucket)]
     #record_counts:
     #            Dict[int, Dict[Tuple[np.bool_, np.int64, np.int32], int]]
     # generate some record_counts:
@@ -158,7 +197,7 @@ def dedupe(dedupe_task_index: int, \
         src_dfl = (np.bool_(True), np.int64(100),np.int32(i))
         mat_bucket_to_src_file_record_count[mat_bucket][src_dfl]=random.randint(1,4000000)
 
-    print(f"dedupe_task_index {dedupe_task_index}, inmemory size {sys.getsizeof(mat_bucket_to_src_file_record_count)}")
+    #print(f"dedupe_task_index {dedupe_task_index}, inmemory size {sys.getsizeof(mat_bucket_to_src_file_record_count)}")
     # send partial record counts on this dedupe task to global actor
     record_counts_pending_materialize.add_record_counts.remote(
         dedupe_task_index,
@@ -166,19 +205,21 @@ def dedupe(dedupe_task_index: int, \
     )
 
     # reduce all record counts and pull the final record_counts
+    record_start=time.time()
     finalized = False
     while not finalized:
         finalized = ray.get(
             record_counts_pending_materialize.is_finalized.remote()
         )
         time.sleep(0.25)
-    
+    record_end = time.time()
     if dedupe_task_index==0:
         #ask one task to trigger the upload
         upload_start = time.time()
-        ray.get(record_counts_pending_materialize.upload_to_s3.remote('benchmark-recordcounts','record_counts', 'us-east-1'))
+        ray.get(record_counts_pending_materialize.to_s3.remote('benchmark-recordcounts','record_counts', 'us-east-1'))
         ray.get(singalactor.send.remote())
         upload_end = time.time()
+        print(f"record add up took {(record_end-record_start):.2f} seconds")
         print(f"upload to s3 completed in {(upload_end-upload_start):.2f} seconds")
     #sync all tasks to begin download
     ray.get(singalactor.wait.remote())
@@ -187,7 +228,8 @@ def dedupe(dedupe_task_index: int, \
     # )
     start = time.time()
     #TODO, assign one task to download, and share object ref via singal actor
-    record_counts = download_from_s3('benchmark-recordcounts','record_counts', 'us-east-1','parquet')
+    if dedupe_task_index in delegator_indices:
+        record_counts = download_from_s3('benchmark-recordcounts','record_counts', 'us-east-1','parquet')
     end = time.time()
     return end-start
 
@@ -219,9 +261,10 @@ if __name__ == "__main__":
     ray.init()
     number_dd_tasks = number_of_nodes*32
     number_mat_bucket = number_dd_tasks
+    single_handle = SignalActor.remote()
     actor_handle=RecordCountsPendingMaterializeDF.remote(number_dd_tasks)
     start = time.time()
-    dd_tasks = [dedupe.remote(i,actor_handle,number_src_dfl,number_mat_bucket) for i in range(number_dd_tasks)]
+    dd_tasks = [dedupe.remote(i,actor_handle,number_src_dfl,number_mat_bucket,single_handle) for i in range(number_dd_tasks)]
     result = ray.get(dd_tasks)
     end = time.time()
     print(f"Total:{(end-start):.2f},nodes:{number_of_nodes},dd:{number_dd_tasks},mat_bucket:{number_mat_bucket}, num_files:{number_src_dfl}")
