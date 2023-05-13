@@ -22,17 +22,11 @@ import io
 import boto3
 from botocore.exceptions import ClientError
 
-def upload_df_to_s3(df, bucket, key, region=None):
-    # Ensure boto3 session is in the correct region
+def upload_df_to_s3(df, bucket, key, region):
     s3 = boto3.resource('s3', region_name=region)
-
-    # Write the DataFrame to an in-memory parquet file
     parquet_buffer = io.BytesIO()
     df.to_parquet(parquet_buffer)
-
-    # Write the in-memory file to S3
     s3.Object(bucket, key).put(Body=parquet_buffer.getvalue())
-
 
 def upload_to_s3(bucket: str, key: str, record_counts: Any, region: str):
     s3 = boto3.resource('s3', region_name=region)
@@ -41,21 +35,16 @@ def upload_to_s3(bucket: str, key: str, record_counts: Any, region: str):
     else:
         serialized_data = pickle.dumps(record_counts)
         s3.Object(bucket, key).put(Body=serialized_data)
-def download_df_from_s3(bucket, key, region=None):
-    # Ensure boto3 session is in the correct region
+def download_df_from_s3(bucket, key, region):
     s3 = boto3.resource('s3', region_name=region)
-
-    # Download the file to an in-memory buffer
     parquet_buffer = io.BytesIO()
     s3.Object(bucket, key).download_fileobj(parquet_buffer)
-
-    # Load the in-memory file to a DataFrame
     df = pd.read_parquet(parquet_buffer)
 
     return df
 def download_from_s3(bucket: str, key: str, region: str, data_type: str):
     if data_type=='parquet':
-        return download_df_from_s3(bucket, key)
+        return download_df_from_s3(bucket, key, region)
     s3 = boto3.resource('s3', region_name=region)
     serialized_data = s3.Object(bucket, key).get()['Body'].read()
     record_counts = pickle.loads(serialized_data)
@@ -138,17 +127,17 @@ class RecordCountsPendingMaterializeDF:
             result_idx: int,
             record_counts:
             Dict[int, Dict[Tuple[np.bool_, np.int64, np.int32], int]]) -> None:
-        start = time.time()
+        #start = time.time()
         for mat_bucket, df_locator_rows in record_counts.items():
             for df_locator, rows in df_locator_rows.items():
                 self.record_counts[mat_bucket][df_locator][result_idx] += rows
         self.actual_result_count += 1
-        end = time.time()
-        print(f"received from task {result_idx}, time taken {(end-start):.2f}")
+        #end = time.time()
+        #print(f"received from task {result_idx}, time taken {(end-start):.2f}")
  
 
     def get_record_counts(self):
-        print(f"received task request for final data")
+        #print(f"received task request for final data")
         return self.record_counts
 
     def get_expected_result_count(self) -> int:
