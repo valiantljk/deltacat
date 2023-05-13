@@ -35,6 +35,7 @@ def download_df_from_s3(bucket, key, region):
         print(f"Error downloading {key} from bucket {bucket}, Error: {e}")
     return pd.read_parquet(parquet_buffer)
 
+@ray.remote
 def download_from_s3(bucket: str, key: str, region: str, data_type: str=None):
     if data_type=='parquet':
         return download_df_from_s3(bucket, key, region)
@@ -110,7 +111,7 @@ class RecordCountsPendingMaterializeDict:
         upload_to_s3(bucket, key, serializable_record_counts,region)
         return len(self.record_counts)
     def from_s3(self, bucket, keys, region):
-        record_counts =[download_from_s3(bucket, key, region) for key in keys]
+        record_counts =ray.get([download_from_s3.remote(bucket, key, region) for key in keys])
         final_record={}
         for rc in record_counts:
             final_record.update(rc)
@@ -170,7 +171,7 @@ class RecordCountsPendingMaterializeDF:
         return len(self.record_counts_df)
     
     def from_s3(self, bucket, keys, region):
-        record_counts =[download_from_s3(bucket, k, region, 'parquet') for k in keys]
+        record_counts =ray.get([download_from_s3.remote(bucket, k, region, 'parquet') for k in keys])
         final_record=pd.concat(record_counts)
         self.record_counts_ref = ray.put(final_record)
         record_counts=None
